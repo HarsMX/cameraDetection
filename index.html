@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Deteksi Isyarat Tangan</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            background: #1e1e2f;
+            margin: 0;
+            padding: 20px;
+            color: white;
+            position: relative;
+        }
+        .container {
+            position: relative;
+            display: inline-block;
+            background: #000;
+            border-radius: 12px;
+            overflow: hidden;
+        }
+        video, canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: auto;
+        }
+        video {
+            transform: scaleX(-1);
+        }
+        canvas {
+            pointer-events: auto;
+            cursor: crosshair;
+        }
+        .controls {
+            margin-top: 20px;
+        }
+        button {
+            background: #4caf50;
+            border: none;
+            color: white;
+            padding: 8px 16px;
+            margin: 5px;
+            border-radius: 20px;
+            cursor: pointer;
+        }
+        .info-panel {
+            background: #2c2c3a;
+            padding: 8px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            margin-top: 15px;
+            display: inline-block;
+            text-align: left;
+            font-family: monospace;
+        }
+        .status {
+            font-size: 12px;
+            margin-top: 10px;
+        }
+        select {
+            background: #2c2c3a;
+            color: white;
+            border: none;
+            padding: 5px 10px;
+            border-radius: 12px;
+            margin-left: 10px;
+        }
+        /* Panel gestur di kanan layar */
+        .gesture-panel {
+            position: fixed;
+            top: 50%;
+            right: 20px;
+            transform: translateY(-50%);
+            background: rgba(0,0,0,0.8);
+            border-radius: 30px;
+            padding: 20px 30px;
+            text-align: center;
+            font-size: 24px;
+            font-weight: bold;
+            border-left: 5px solid #ffaa44;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            backdrop-filter: blur(5px);
+            min-width: 150px;
+        }
+        .gesture-text {
+            color: #ffaa44;
+            font-size: 32px;
+            margin-top: 10px;
+        }
+        .gesture-emoji {
+            font-size: 48px;
+        }
+        @media (max-width: 800px) {
+            .gesture-panel {
+                position: static;
+                margin-top: 20px;
+                transform: none;
+                display: inline-block;
+            }
+        }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core@3.11.0/dist/tf-core.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter@3.11.0/dist/tf-converter.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl@3.11.0/dist/tf-backend-webgl.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/handpose@0.0.7/dist/handpose.min.js"></script>
+</head>
+<body>
+    <h1>✋ Deteksi Isyarat Tangan</h1>
+    <div class="container" style="width: 100%; max-width: 640px; aspect-ratio: 4/3;">
+        <video id="video" autoplay playsinline muted style="width: 100%; height: auto;"></video>
+        <canvas id="canvas" style="width: 100%; height: auto;"></canvas>
+    </div>
+    <div class="controls">
+        <button id="startBtn">▶️ Mulai Kamera & Deteksi</button>
+        <button id="stopBtn" disabled>⏹️ Hentikan</button>
+        <select id="performanceSelect">
+            <option value="1">Halus (deteksi setiap frame)</option>
+            <option value="2" selected>Seimbang (tiap 2 frame)</option>
+            <option value="3">Ringan (tiap 3 frame)</option>
+        </select>
+    </div>
+    <div class="info-panel" id="coordInfo">
+        🖱️ Arahkan mouse ke titik kerangka untuk melihat koordinat
+    </div>
+    <div class="status" id="statusMsg">Status: Siap</div>
+
+    <!-- Panel gestur di kanan -->
+    <div class="gesture-panel">
+        <div>✨ Gestur Terdeteksi ✨</div>
+        <div class="gesture-emoji" id="gestureEmoji">❓</div>
+        <div class="gesture-text" id="gestureText">Tidak ada</div>
+    </div>
+
+    <script>
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const perfSelect = document.getElementById('performanceSelect');
+        const statusDiv = document.getElementById('statusMsg');
+        const coordInfoDiv = document.getElementById('coordInfo');
+        const gestureEmoji = document.getElementById('gestureEmoji');
+        const gestureText = document.getElementById('gestureText');
+
+        let stream = null;
+        let model = null;
+        let animationId = null;
+        let frameCount = 0;
+        let detectInterval = 2;
+        let isDetecting = false;
+        let lastPredictions = null;
+        let videoWidth = 0, videoHeight = 0;
+        let screenPoints = [];
+
+        perfSelect.addEventListener('change', () => {
+            detectInterval = parseInt(perfSelect.value);
+            if (isDetecting) {
+                statusDiv.innerText = `Status: Mode deteksi setiap ${detectInterval} frame.`;
+            }
+        });
+
+        async function loadModel() {
+            statusDiv.innerText = 'Status: Memuat model...';
+            try {
+                model = await handpose.load();
+                statusDiv.innerText = 'Status: Model siap. Klik Mulai.';
+                startBtn.disabled = false;
+            } catch (err) {
+                statusDiv.innerText = 'Status: Gagal memuat model. Periksa koneksi.';
+                startBtn.disabled = true;
+            }
+        }
+
+        async function startCamera() {
+            if (stream) stopCamera();
+            try {
+                const constraints = {
+                    video: {
+                        width: { ideal: 320 },
+                        height: { ideal: 240 },
+                        frameRate: { ideal: 12 }
+                    }
+                };
+                stream = await navigator.mediaDevices.getUserMedia(constraints);
+                video.srcObject = stream;
+                await video.play();
+
+                videoWidth = video.videoWidth;
+                videoHeight = video.videoHeight;
+
+                const resizeCanvas = () => {
+                    const rect = video.getBoundingClientRect();
+                    canvas.width = rect.width;
+                    canvas.height = rect.height;
+                    canvas.style.width = `${rect.width}px`;
+                    canvas.style.height = `${rect.height}px`;
+                };
+                window.addEventListener('resize', resizeCanvas);
+                resizeCanvas();
+
+                isDetecting = true;
+                detectLoop();
+
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+                statusDiv.innerText = `Status: Kamera menyala, deteksi setiap ${detectInterval} frame.`;
+            } catch (err) {
+                statusDiv.innerText = 'Status: Gagal akses kamera.';
+                console.error(err);
+                startBtn.disabled = false;
+            }
+        }
+
+        async function detectLoop() {
+            if (!isDetecting) return;
+
+            if (model && video.readyState === 4 && !video.paused && !video.ended) {
+                if (frameCount % detectInterval === 0) {
+                    try {
+                        const predictions = await model.estimateHands(video);
+                        lastPredictions = predictions;
+                        // Deteksi gestur dari predictions terbaru
+                        detectGesture(predictions);
+                    } catch (err) {
+                        console.warn(err);
+                    }
+                }
+            }
+
+            drawHands(lastPredictions);
+            frameCount++;
+            animationId = requestAnimationFrame(detectLoop);
+        }
+
+        // Fungsi deteksi gestur: thumbs up, middle finger
+        function detectGesture(predictions) {
+            if (!predictions || predictions.length === 0) {
+                gestureEmoji.innerHTML = "❓";
+                gestureText.innerHTML = "Tidak ada";
+                return;
+            }
+
+            // Ambil tangan pertama (asumsi satu tangan)
+            const hand = predictions[0];
+            const landmarks = hand.landmarks;
+            if (!landmarks) return;
+
+            // Indeks landmark (standar MediaPipe)
+            // 0: wrist, 1-4: thumb, 5-8: index, 9-12: middle, 13-16: ring, 17-20: pinky
+            // Untuk menentukan apakah jari terangkat, bandingkan tip y dengan base atau joint bawahnya
+            // Karena koordinat y mengecil ke atas (jika tangan vertikal), kita perlu hati-hati
+            // Kita akan menggunakan pendekatan: jari terangkat jika tip y < (base y - threshold)
+            // Tapi perlu disesuaikan dengan orientasi tangan. Kita bisa bandingkan dengan posisi pergelangan tangan.
+            const wristY = landmarks[0][1];
+            // Fungsi untuk mengecek apakah jari terentang (extended)
+            function isFingerExtended(tipIdx, baseIdx) {
+                const tipY = landmarks[tipIdx][1];
+                const baseY = landmarks[baseIdx][1];
+                // Jika tipY lebih kecil (lebih atas) dari baseY, maka jari terangkat (asumsi tangan menghadap kamera)
+                return tipY < baseY - 15; // threshold 15 piksel
+            }
+
+            // Untuk jempol (thumb), karena bergerak ke samping, kita bandingkan sumbu X
+            function isThumbUp() {
+                const thumbTip = landmarks[4];
+                const thumbBase = landmarks[2];
+                // Karena video di-mirror, kita perlu mempertimbangkan orientasi. Gunakan koordinat asli.
+                // Untuk jempol ke atas: tip x lebih ke kiri (atau kanan tergantung tangan)
+                // Lebih sederhana: periksa apakah tip y lebih kecil dari base y dan tip x berbeda.
+                // Tapi karena gestur thumbs up biasanya jempol tegak, kita bisa bandingkan y.
+                // Karena kita pakai y, thumbs up: tip y < base y (jempol terangkat ke atas)
+                return thumbTip[1] < thumbBase[1] - 10;
+            }
+
+            // Deteksi middle finger: jari tengah terentang, jari lain tidak (atau minimal telunjuk dan manis/kelingking tidak terentang)
+            const middleExtended = isFingerExtended(12, 9); // middle tip vs middle base
+            const indexExtended = isFingerExtended(8, 5);
+            const ringExtended = isFingerExtended(16, 13);
+            const pinkyExtended = isFingerExtended(20, 17);
+            const thumbUp = isThumbUp();
+
+            // Gestur Thumbs Up (Good): jempol terangkat, jari lainnya mengepal (tidak terentang)
+            if (thumbUp && !indexExtended && !middleExtended && !ringExtended && !pinkyExtended) {
+                gestureEmoji.innerHTML = "👍";
+                gestureText.innerHTML = "GOOD";
+                return;
+            }
+
+            // Gestur Middle Finger (Fuck): jari tengah terentang, jari lain tidak (jempol bisa ikut atau tidak)
+            if (middleExtended && !indexExtended && !ringExtended && !pinkyExtended) {
+                gestureEmoji.innerHTML = "🖕";
+                gestureText.innerHTML = "FUCK";
+                return;
+            }
+
+            // Jika tidak ada gestur yang dikenali
+            gestureEmoji.innerHTML = "❓";
+            gestureText.innerHTML = "Tidak ada";
+        }
+
+        function drawHands(predictions) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            if (!predictions || predictions.length === 0) {
+                screenPoints = [];
+                return;
+            }
+
+            const scaleX = canvas.width / videoWidth;
+            const scaleY = canvas.height / videoHeight;
+            const allPoints = [];
+
+            for (let h = 0; h < predictions.length; h++) {
+                const hand = predictions[h];
+                const landmarks = hand.landmarks;
+                if (!landmarks) continue;
+
+                for (let i = 0; i < landmarks.length; i++) {
+                    let [x, y] = landmarks[i];
+                    x = x * scaleX;
+                    y = y * scaleY;
+                    const mirrorX = canvas.width - x;
+                    const screenX = mirrorX;
+                    const screenY = y;
+                    allPoints.push({
+                        x: screenX,
+                        y: screenY,
+                        index: i,
+                        hand: h,
+                        originalX: x,
+                        originalY: y
+                    });
+
+                    ctx.beginPath();
+                    ctx.arc(screenX, screenY, 4, 0, 2 * Math.PI);
+                    ctx.fillStyle = '#00ffcc';
+                    ctx.fill();
+                    ctx.strokeStyle = '#ffffff';
+                    ctx.stroke();
+
+                    ctx.font = "10px monospace";
+                    ctx.fillStyle = "#ffffff";
+                    ctx.fillText(i, screenX + 5, screenY - 3);
+                }
+
+                const connections = [
+                    [0,1], [1,2], [2,3], [3,4],
+                    [0,5], [5,6], [6,7], [7,8],
+                    [0,9], [9,10], [10,11], [11,12],
+                    [0,13], [13,14], [14,15], [15,16],
+                    [0,17], [17,18], [18,19], [19,20]
+                ];
+                ctx.strokeStyle = '#ffaa44';
+                ctx.lineWidth = 2.5;
+                for (let conn of connections) {
+                    const [startIdx, endIdx] = conn;
+                    if (landmarks[startIdx] && landmarks[endIdx]) {
+                        let [x1, y1] = landmarks[startIdx];
+                        let [x2, y2] = landmarks[endIdx];
+                        x1 = x1 * scaleX;
+                        y1 = y1 * scaleY;
+                        x2 = x2 * scaleX;
+                        y2 = y2 * scaleY;
+                        const mirrorX1 = canvas.width - x1;
+                        const mirrorX2 = canvas.width - x2;
+                        ctx.beginPath();
+                        ctx.moveTo(mirrorX1, y1);
+                        ctx.lineTo(mirrorX2, y2);
+                        ctx.stroke();
+                    }
+                }
+            }
+
+            screenPoints = allPoints;
+        }
+
+        function handleMouseMove(e) {
+            if (!screenPoints.length) {
+                coordInfoDiv.innerHTML = '🖱️ Arahkan mouse ke titik kerangka untuk melihat koordinat';
+                return;
+            }
+
+            const rect = canvas.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left;
+            const mouseY = e.clientY - rect.top;
+
+            let minDist = 20;
+            let closest = null;
+
+            for (let p of screenPoints) {
+                const dx = p.x - mouseX;
+                const dy = p.y - mouseY;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+                if (dist < minDist) {
+                    minDist = dist;
+                    closest = p;
+                }
+            }
+
+            if (closest) {
+                coordInfoDiv.innerHTML = `🔍 Titik ${closest.index} → Koordinat layar: (${Math.round(closest.x)}, ${Math.round(closest.y)}) px<br>
+                                          📍 Koordinat asli (video): (${Math.round(closest.originalX)}, ${Math.round(closest.originalY)}) px`;
+            } else {
+                coordInfoDiv.innerHTML = '🖱️ Arahkan mouse ke titik kerangka untuk melihat koordinat';
+            }
+        }
+
+        canvas.addEventListener('mousemove', handleMouseMove);
+
+        function stopCamera() {
+            isDetecting = false;
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+                animationId = null;
+            }
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+                stream = null;
+            }
+            video.srcObject = null;
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            lastPredictions = null;
+            screenPoints = [];
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            statusDiv.innerText = 'Status: Dihentikan.';
+            coordInfoDiv.innerHTML = '🖱️ Arahkan mouse ke titik kerangka untuk melihat koordinat';
+            gestureEmoji.innerHTML = "❓";
+            gestureText.innerHTML = "Tidak ada";
+            frameCount = 0;
+        }
+
+        startBtn.addEventListener('click', async () => {
+            if (!model) {
+                await loadModel();
+                if (!model) return;
+            }
+            startCamera();
+        });
+        stopBtn.addEventListener('click', stopCamera);
+
+        loadModel();
+    </script>
+</body>
+</html>
